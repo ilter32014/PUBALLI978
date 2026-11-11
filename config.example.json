@@ -1,0 +1,8 @@
+{
+  "ollama_url": "",
+  "api_token": "",
+  "model": "manomini-demo-1.0",
+  "chat_model": "manomini-chat-1.0",
+  "action_model": "manomini-demo-1.0",
+  "groq_model": "openai/gpt-oss-20b"
+}
