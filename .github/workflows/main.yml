@@ -193,30 +193,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
           echo "::add-mask::$API_TOKEN"
+
           API_ACCESS_TOKEN="$API_TOKEN" python3 -u proxy.py > proxy.log 2>&1 &
           PROXY_PID=$!
           echo "$PROXY_PID" > proxy.pid
 
+          # /api/tags is intentionally public in proxy.py, so readiness must be HTTP 200.
           PROXY_READY=false
           for i in {1..45}; do
             if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-              echo "Authenticated proxy exited during startup."
+              echo "Proxy exited during startup."
               cat proxy.log || true
               exit 1
             fi
-            AUTH_CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --connect-timeout 2 --max-time 5 http://127.0.0.1:11435/api/tags 2>/dev/null || true)
-            if [ "$AUTH_CODE" = "401" ]; then
+
+            LOCAL_CODE=$(curl --silent --output local-tags.json --write-out '%{http_code}' \
+              --connect-timeout 2 --max-time 5 \
+              http://127.0.0.1:11435/api/tags 2>/dev/null || true)
+
+            if [ "$LOCAL_CODE" = "200" ] && jq -e '.models | type == "array"' local-tags.json >/dev/null 2>&1; then
               PROXY_READY=true
               break
             fi
+
+            echo "Waiting for local proxy (attempt $i/45, HTTP $LOCAL_CODE)..."
             sleep 1
           done
+
           if [ "$PROXY_READY" != "true" ]; then
-            echo "Authenticated proxy did not become ready on 127.0.0.1:11435."
+            echo "Proxy did not return a valid public /api/tags response."
+            cat local-tags.json 2>/dev/null || true
             cat proxy.log || true
+            exit 1
+          fi
+
+          # Confirm protected endpoints still reject requests without a token.
+          CHAT_UNAUTH_CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 2 --max-time 5 \
+            -H "Content-Type: application/json" \
+            -d '{"model":"manomini-chat-1.0","messages":[{"role":"user","content":"test"}],"stream":false}' \
+            http://127.0.0.1:11435/api/chat 2>/dev/null || true)
+
+          if [ "$CHAT_UNAUTH_CODE" != "401" ]; then
+            echo "Protected /api/chat endpoint did not reject an unauthenticated request (HTTP $CHAT_UNAUTH_CODE)."
             exit 1
           fi
 
@@ -231,19 +253,21 @@ jobs:
               cat cloudflared.log || true
               exit 1
             fi
+
             URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
-            if [ -n "$URL" ]; then break; fi
+            if [ -n "$URL" ]; then
+              break
+            fi
             sleep 2
           done
+
           if [ -z "$URL" ]; then
             echo "Cloudflare did not provide a Quick Tunnel URL."
             cat cloudflared.log || true
             exit 1
           fi
 
-          # Quick Tunnel DNS propagation is asynchronous. Do not test the URL
-          # just because cloudflared printed it; wait until the public route
-          # actually reaches the authenticated proxy.
+          # Wait until the public tunnel returns a valid, unauthenticated /api/tags response.
           PUBLIC_READY=false
           for i in {1..90}; do
             if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
@@ -251,47 +275,76 @@ jobs:
               cat cloudflared.log || true
               exit 1
             fi
-            AUTH_CODE=$(curl --silent --output auth-response.json --write-out '%{http_code}' \
-              --connect-timeout 5 --max-time 15 "$URL/api/tags" 2>/dev/null || true)
-            if [ "$AUTH_CODE" = "401" ]; then
+
+            PUBLIC_CODE=$(curl --silent --output public-tags.json --write-out '%{http_code}' \
+              --connect-timeout 5 --max-time 15 \
+              "$URL/api/tags" 2>/dev/null || true)
+
+            if [ "$PUBLIC_CODE" = "200" ] && jq -e '.models | type == "array"' public-tags.json >/dev/null 2>&1; then
               PUBLIC_READY=true
               break
             fi
-            echo "Waiting for public tunnel readiness (attempt $i/90, HTTP $AUTH_CODE)..."
+
+            echo "Waiting for public tunnel (attempt $i/90, HTTP $PUBLIC_CODE)..."
             sleep 3
           done
+
           if [ "$PUBLIC_READY" != "true" ]; then
-            echo "Public tunnel did not reach the authenticated proxy in time."
-            echo "Last HTTP status: $AUTH_CODE"
-            cat auth-response.json 2>/dev/null || true
+            echo "Public tunnel did not return a valid /api/tags response."
+            echo "Last HTTP status: $PUBLIC_CODE"
+            cat public-tags.json 2>/dev/null || true
             cat proxy.log || true
             cat cloudflared.log || true
             exit 1
           fi
 
+          # Verify the Bearer token is accepted by the public API.
           AUTH_READY=false
           for i in {1..15}; do
-            AUTH_CODE=$(curl -sS --connect-timeout 5 --max-time 20 -o auth-response.json -w '%{http_code}' \
-              -H "Authorization: Bearer $API_TOKEN" "$URL/api/tags" || true)
-            if [ "$AUTH_CODE" = "200" ]; then
+            AUTH_CODE=$(curl --silent --output authenticated-tags.json --write-out '%{http_code}' \
+              --connect-timeout 5 --max-time 20 \
+              -H "Authorization: Bearer $API_TOKEN" \
+              "$URL/api/tags" 2>/dev/null || true)
+
+            if [ "$AUTH_CODE" = "200" ] && jq -e '.models | type == "array"' authenticated-tags.json >/dev/null 2>&1; then
               AUTH_READY=true
               break
             fi
+
             echo "Waiting for authenticated API response (attempt $i/15, HTTP $AUTH_CODE)..."
             sleep 3
           done
+
           if [ "$AUTH_READY" != "true" ]; then
-            echo "Authenticated public API verification failed after retries (HTTP $AUTH_CODE)."
-            cat proxy.log
-            cat cloudflared.log
-            [ ! -f auth-response.json ] || cat auth-response.json
+            echo "Authenticated public API verification failed (HTTP $AUTH_CODE)."
+            cat proxy.log || true
+            cat cloudflared.log || true
+            cat authenticated-tags.json 2>/dev/null || true
+            exit 1
+          fi
+
+          # Verify protected chat works with the token.
+          CHAT_AUTH_CODE=$(curl --silent --output authenticated-chat.json --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 180 \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg model "$CHAT_MODEL" '{model:$model,messages:[{role:"user",content:"Reply with API_OK only."}],stream:false,options:{num_predict:32}}')" \
+            "$URL/api/chat" 2>/dev/null || true)
+
+          if [ "$CHAT_AUTH_CODE" != "200" ] || ! jq -e '.message.content | length > 0' authenticated-chat.json >/dev/null 2>&1; then
+            echo "Authenticated /api/chat test failed (HTTP $CHAT_AUTH_CODE)."
+            cat authenticated-chat.json 2>/dev/null || true
+            cat proxy.log || true
+            cat cloudflared.log || true
             exit 1
           fi
 
           mkdir -p connection
           printf 'OLLAMA_URL=%s\nAPI_TOKEN=%s\nCHAT_MODEL=%s\nACTION_MODEL=%s\n' \
             "$URL" "$API_TOKEN" "$CHAT_MODEL" "$ACTION_MODEL" > connection/connection.txt
+
           echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+
           {
             echo "## ManoMINI Dual Model API"
             echo ""
@@ -304,7 +357,14 @@ jobs:
             echo "| Runtime | $RUNTIME_MINUTES minutes |"
             echo "| Public API | $URL |"
             echo ""
-            echo "The API requires the private connection artifact's Bearer token."
+            echo "| Endpoint | Access |"
+            echo "|---|---|"
+            echo "| GET /api/tags | Public |"
+            echo "| GET /api/version | Public |"
+            echo "| POST /api/chat | Bearer token |"
+            echo "| Other /api endpoints | Bearer token |"
+            echo ""
+            echo "The private connection artifact contains the Bearer token."
             echo "Download the \`manomini-connection\` artifact from this workflow run."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -322,24 +382,29 @@ jobs:
           RUNTIME_SECONDS=$((RUNTIME_MINUTES * 60))
           DEADLINE=$((SECONDS + RUNTIME_SECONDS))
           echo "ManoMINI is ready: $PUBLIC_URL"
+
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
             if ! curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags >/dev/null; then
               echo "Ollama stopped."
-              cat ollama.log
+              cat ollama.log || true
               exit 1
             fi
+
             if ! kill -0 "$(cat proxy.pid)" 2>/dev/null; then
               echo "Authenticated proxy stopped."
-              cat proxy.log
+              cat proxy.log || true
               exit 1
             fi
+
             if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
               echo "Cloudflare tunnel stopped."
-              cat cloudflared.log
+              cat cloudflared.log || true
               exit 1
             fi
+
             sleep 30
           done
+
           echo "Requested runtime completed."
 
       - name: Upload diagnostic logs
