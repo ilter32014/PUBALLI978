@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import hmac
@@ -6,23 +5,31 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 UPSTREAM = "http://127.0.0.1:11434"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("OLLAMA_PROXY_PORT", "11435"))
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
+# Only these read-only endpoints are intentionally available without a token.
 PUBLIC_ENDPOINTS = {
     ("GET", "/api/tags"),
     ("GET", "/api/version"),
 }
 
 HOP_BY_HOP_HEADERS = {
-    "connection", "keep-alive", "proxy-authenticate",
-    "proxy-authorization", "te", "trailers",
-    "transfer-encoding", "upgrade", "host", "authorization",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "authorization",
 }
 
 
@@ -76,6 +83,8 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # /api/tags and /api/version are public for model discovery.
+        # All other API routes require the private Bearer token.
         if (self.command, endpoint) not in PUBLIC_ENDPOINTS:
             if not authorization_is_valid(
                 self.headers.get("Authorization"),
@@ -96,11 +105,7 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "Request body is too large"})
             return
 
-        body = (
-            self.rfile.read(content_length)
-            if content_length
-            else None
-        )
+        body = self.rfile.read(content_length) if content_length else None
 
         headers = {
             key: value
@@ -111,7 +116,6 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
                 "accept-encoding",
             }
         }
-
         headers["Accept-Encoding"] = "identity"
 
         request = Request(
@@ -123,10 +127,8 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
 
         try:
             upstream = urlopen(request, timeout=3600)
-
         except HTTPError as error:
             upstream = error
-
         except (URLError, TimeoutError, OSError) as error:
             self._send_json(
                 502,
@@ -151,16 +153,13 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
 
             while True:
                 chunk = upstream.read(64 * 1024)
-
                 if not chunk:
                     break
-
                 self.wfile.write(chunk)
                 self.wfile.flush()
 
         except (BrokenPipeError, ConnectionResetError):
             pass
-
         finally:
             upstream.close()
             self.close_connection = True
@@ -182,13 +181,9 @@ def main() -> None:
         (HOST, PORT),
         OllamaProxyHandler,
     )
-
     server.api_token = token
 
-    print(
-        f"ManoMINI proxy listening on {HOST}:{PORT}"
-    )
-
+    print(f"ManoMINI proxy listening on {HOST}:{PORT}")
     server.serve_forever()
 
 
